@@ -2,12 +2,28 @@
 
 import sys
 import struct
+from typing import NamedTuple
 import zlib
+import sqlite3
+import pickle
 import numpy as np
 
 
 SECTOR_HEADER = np.unpackbits(np.array([0xFF, 0xFF, 0xFD, 0x57], dtype=np.uint8))
 SECTOR_DATA = np.unpackbits(np.array([0xFF, 0xFF, 0xFD, 0xDB], dtype=np.uint8))
+
+class InvalidHeader(Exception):
+    """Raised when an invalid header field is encountered"""
+
+class FluxTrack(NamedTuple):
+    track: int
+    flux: np.ndarray
+
+class DataSector(NamedTuple):
+    logical_track: int
+    logical_sector: int
+    payload: bytes
+    crc_pass: bool
 
 
 def bytecode_to_array(bytecode: bytes):
@@ -89,6 +105,9 @@ def find_pattern(flux, pattern, threshold=0.85):
     # may get multiple samples above threshold for a single peak
     indices_over_threshold = np.argwhere(np.abs(conv) > threshold)[:,0]
 
+    if indices_over_threshold.size == 0:
+        return []
+
     peak_groups = np.split(indices_over_threshold, np.argwhere(np.diff(indices_over_threshold) > 4)[:,0] + 1)
 
     peak_indices = []
@@ -96,7 +115,7 @@ def find_pattern(flux, pattern, threshold=0.85):
         group_peak_index = np.argmax(np.abs(conv[peak_group_indices]))
         peak_indices.append(peak_group_indices[0] + group_peak_index)
 
-    return peak_indices
+    return np.array(peak_indices)
 
 
 def make_matched_filter_from_bit_pattern(bit_pattern):
@@ -314,6 +333,15 @@ def decode_sector_record(flux):
         flux_segment = flux[ii*samples_per_gcr_word : (ii+1)*samples_per_gcr_word + SYMBOL_PERIOD]
         decoded_gcr_words.append(gcr_decoder(flux_segment, header_gcr_kernels))
 
+    logical_track = decoded_gcr_words[0]
+    logical_sector = decoded_gcr_words[1]
+
+    if logical_track > 38:
+        raise InvalidHeader(f'Logical track is {logical_track} but should be in [0,38]')
+
+    if logical_sector > 11:
+        raise InvalidHeader(f'Logical sector is {logical_sector} but should be in [0,11]')
+
     return decoded_gcr_words
 
 
@@ -337,6 +365,37 @@ def check_crc(data_sector):
 
     return crc_in_record == crc_from_data
 
+
+def load_flux_file(filename):
+
+    conn = sqlite3.connect(filename)
+    cur = conn.cursor()
+
+    cur.execute('SELECT * FROM properties')
+    properties = cur.fetchall()
+
+    for p in properties:
+        if p[0] == 'version':
+            if p[1] != '3':
+                raise RuntimeError(f'This flux file is version {p[1]} but only version 3 is supported')
+
+    cur.execute('SELECT * FROM zdata')
+    data = cur.fetchall()
+
+    tracks = []
+    for ii, track in enumerate(data):
+        print(f'loading track {ii:02d} of {len(data)}')
+        tracks.append(
+            FluxTrack(
+                track[0],  # track number
+                bytecode_to_array(zlib.decompress(track[2]))[1],  # decoded flux data
+            )
+        )
+
+    return tracks
+
+
+
 """
 Things left to do:
 
@@ -351,33 +410,112 @@ Things left to do:
 
 
 def main(filename):
-    with open(filename, 'rb') as f:
-        data_zlib = f.read()
-        data = zlib.decompress(data_zlib)
 
-    pulse_train, flux, pulse_intervals = bytecode_to_array(data)
+    # typical number of samples between start of header segment to start of data segment
+    HEADER_TO_DATA_SAMPLES_MEAN = 8704
 
-    header_start_indices = find_pattern(flux, SECTOR_HEADER)
-    data_start_indices = find_pattern(flux, SECTOR_DATA)
+    # allowed range of samples between start of header segment and start of data segment
+    HEADER_TO_DATA_SAMPLES_MIN = HEADER_TO_DATA_SAMPLES_MEAN - 100
+    HEADER_TO_DATA_SAMPLES_MAX = HEADER_TO_DATA_SAMPLES_MEAN + 100
 
-    header_bytes_pos = []
-    header_bytes_neg = []
-    sector_0_idx = None
-    for header_start_index in header_start_indices:
-        flux_sector = flux[header_start_index - 47:]
-        header_bytes_pos.append(decode_sector_record(flux_sector))
-        header_bytes_neg.append(decode_sector_record(1 - flux_sector))
-        if header_bytes_pos[-1][1] == 0 and sector_0_idx is None:
-            sector_0_idx = len(header_bytes_pos) - 1
+    try:
+        tracks = pickle.load(open(filename + '.pickle', 'rb'))
+        print('Loaded from pickle file!')
+    except:
+        print('No pickle found, loading from flux file...')
+        tracks = load_flux_file(filename)
+        print('Pickling this to speed up future load')
+        pickle.dump(tracks, open(filename + '.pickle', 'wb'))
 
-    flux_data_sector_0 = flux[data_start_indices[sector_0_idx] - 47 :]
-    data_bytes_sector_0 = decode_data_sector(flux_data_sector_0)
-    payload_bytes_sector_0 = data_bytes_sector_0[:256]
+    # dict of DataSegment objects where key is a tuple of (logical_track, logical_segment)
+    sectors = {}
 
-    if not check_crc(data_bytes_sector_0):
-        print('CRC check failed')
+    for track in tracks:
+        print(f'Decoding flux for physical track {track.track}...')
 
-    payload_bytes_sector_0.tofile('/tmp/good_disk/track0sector0.bin')
+        header_start_indices = find_pattern(track.flux, SECTOR_HEADER)
+        data_start_indices = find_pattern(track.flux, SECTOR_DATA)
+
+        for header_start_index in header_start_indices:
+            try:
+                logical_track, logical_sector = decode_sector_record(track.flux[header_start_index - 47:])
+            except ValueError:
+                print(f'Could not decode header starting at {header_start_index} on physical track {track.track}; probably off end of flux file')
+                continue
+            except InvalidHeader as e:
+                print('Discarding invalid header: ' + str(e))
+                continue
+
+            print(f'found header for logical track: {logical_track} logical sector: {logical_sector}')
+            sector_dict_key = (logical_track, logical_sector)
+
+            data_start_candidates = data_start_indices[np.logical_and(
+                data_start_indices >= header_start_index + HEADER_TO_DATA_SAMPLES_MIN,
+                data_start_indices <= header_start_index + HEADER_TO_DATA_SAMPLES_MAX)]
+
+            if data_start_candidates.size == 0:
+                print(f'No data segments found for header starting at {header_start_index} on physical track {track.track}; probably off end of flux file')
+                continue
+
+            for data_start_index in data_start_candidates:
+
+                try:
+                    data_bytes = decode_data_sector(track.flux[data_start_index - 47:])
+                except ValueError:
+                    print(f'Could not decode data starting at {data_start_index} on physical track {track.track}; probably off end of flux file')
+                    continue
+
+                if sector_dict_key not in sectors:
+                    print(f'decoded new data segment for logical track: {logical_track} logical sector: {logical_sector}')
+                    sectors[sector_dict_key] = DataSector(
+                        logical_track,
+                        logical_sector,
+                        data_bytes[:256],
+                        check_crc(data_bytes),
+                    )
+                else:
+                    sector = sectors[sector_dict_key]
+
+                    # only replace existing sector if the new one passes CRC check but the exiting
+                    # one doesn't
+                    if not sector.crc_pass and check_crc(data_bytes):
+                        print(f'replacing data segment for logical track: {logical_track} logical sector: {logical_sector}')
+                        sectors[sector_dict_key] = DataSector(
+                            logical_track,
+                            logical_sector,
+                            data_bytes[:256],
+                            check_crc(data_bytes),
+                        )
+
+
+
+    # with open(filename, 'rb') as f:
+    #     data_zlib = f.read()
+    #     data = zlib.decompress(data_zlib)
+
+    # pulse_train, flux, pulse_intervals = bytecode_to_array(data)
+
+    # header_start_indices = find_pattern(flux, SECTOR_HEADER)
+    # data_start_indices = find_pattern(flux, SECTOR_DATA)
+
+    # header_bytes_pos = []
+    # header_bytes_neg = []
+    # sector_0_idx = None
+    # for header_start_index in header_start_indices:
+    #     flux_sector = flux[header_start_index - 47:]
+    #     header_bytes_pos.append(decode_sector_record(flux_sector))
+    #     header_bytes_neg.append(decode_sector_record(1 - flux_sector))
+    #     if header_bytes_pos[-1][1] == 0 and sector_0_idx is None:
+    #         sector_0_idx = len(header_bytes_pos) - 1
+
+    # flux_data_sector_0 = flux[data_start_indices[sector_0_idx] - 47 :]
+    # data_bytes_sector_0 = decode_data_sector(flux_data_sector_0)
+    # payload_bytes_sector_0 = data_bytes_sector_0[:256]
+
+    # if not check_crc(data_bytes_sector_0):
+    #     print('CRC check failed')
+
+    # payload_bytes_sector_0.tofile('/tmp/good_disk/track0sector0.bin')
 
     import IPython; IPython.embed()
 
