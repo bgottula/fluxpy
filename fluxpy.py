@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import struct
 import zlib
 import numpy as np
 
@@ -33,7 +34,7 @@ def bytecode_to_array(bytecode: bytes):
         1) A Numpy array where the sample rate is 12 MHz (set by the FluxEngine hardware) and each
            element in the array is either 1 or 0 where 1 indicates that a pulse event occurred
            during that clock period.
-        2) A Numpy array with the binary level of the flux versus time. The raw pulse information
+        2) A Numpy array with the bipodal level of the flux versus time. The raw pulse information
            only encodes the transitions so the polarity of this output is arbitrary. The sample
            rate is 12 MHz.
         3) A Numpy array giving the interval in seconds between each pulse.
@@ -52,11 +53,11 @@ def bytecode_to_array(bytecode: bytes):
             pulse_intervals.append(ticks_since_last_pulse * TICK_PERIOD)
             pulse_train += [0] * ticks_since_last_pulse
             pulse_train.append(1)
-            flux += [flux_state] * ticks_since_last_pulse
+            flux += [2 * float(flux_state) - 1] * ticks_since_last_pulse
             flux_state = not flux_state
             ticks_since_last_pulse = 0
 
-    return np.array(pulse_train, dtype=np.uint8), np.array(flux, dtype=np.uint8), np.array(pulse_intervals)
+    return np.array(pulse_train, dtype=np.uint8), np.array(flux), np.array(pulse_intervals)
 
 
 def matched_filter(flux: np.ndarray) -> np.ndarray:
@@ -66,8 +67,7 @@ def matched_filter(flux: np.ndarray) -> np.ndarray:
 
     mf_h = np.ones(SYMBOL_PERIOD) / SYMBOL_PERIOD
 
-    mf_in = 2 * flux.astype(np.float64) - 1
-    return np.convolve(mf_in, mf_h)
+    return np.convolve(flux, mf_h)
 
 
 def timing_recovery(mf_output):
@@ -129,8 +129,7 @@ def find_pattern(flux, pattern, threshold=0.85):
     header_samples = np.repeat(header_symbols, SYMBOL_PERIOD)
     header_samples /= header_samples.size
 
-    mf_in = 2 * flux.astype(np.float64) - 1
-    conv = np.correlate(mf_in, header_samples)
+    conv = np.correlate(flux, header_samples)
 
     # may get multiple samples above threshold for a single peak
     indices_over_threshold = np.argwhere(np.abs(conv) > threshold)[:,0]
@@ -298,10 +297,8 @@ def make_data_gcr_kernels():
 
 def gcr_decoder(flux, kernels):
 
-    flux_bipodal = 2 * flux.astype(np.float64) - 1
-
     # Take absolute value because data is encoded in transitions -- polarity is not important
-    corr = np.abs(np.sum(flux_bipodal * kernels, axis=1))
+    corr = np.abs(np.sum(flux * kernels, axis=1))
 
     # if len(kernels) < 77:
     #     import matplotlib.pyplot as plt
@@ -317,6 +314,7 @@ def decode_data_sector(flux):
     # should be estimated using the full sector flux data rather than relying on extrapolation from
     # the sector start word
     SYMBOL_PERIOD = 47.03
+    SYMBOL_PERIOD_INT = int(np.round(SYMBOL_PERIOD))
 
     BROTHER_DATA_RECORD_ENCODED_SIZE = 415
 
@@ -326,14 +324,36 @@ def decode_data_sector(flux):
     decoded_gcr_words = []
     flux_start_index = 32*SYMBOL_PERIOD  # discard the segment header
     for _ in range(BROTHER_DATA_RECORD_ENCODED_SIZE):
-        flux_segment = flux[int(flux_start_index) : int(flux_start_index) + samples_per_gcr_word]
-        decoded_gcr_words.append(gcr_decoder(flux_segment, data_gcr_kernels))
+
+        flux_early = flux[int(flux_start_index) - 1 : int(flux_start_index) + samples_per_gcr_word - 1]
+        flux_ontime = flux[int(flux_start_index) : int(flux_start_index) + samples_per_gcr_word]
+        flux_late = flux[int(flux_start_index) + 1 : int(flux_start_index) + samples_per_gcr_word + 1]
+
+        early = np.sum(np.abs(np.correlate(flux_early, np.ones(SYMBOL_PERIOD_INT))[::SYMBOL_PERIOD_INT]))
+        ontime = np.sum(np.abs(np.correlate(flux_ontime, np.ones(SYMBOL_PERIOD_INT))[::SYMBOL_PERIOD_INT]))
+        late = np.sum(np.abs(np.correlate(flux_late, np.ones(SYMBOL_PERIOD_INT))[::SYMBOL_PERIOD_INT]))
+
+        best_seg_idx = np.argmax((early, ontime, late))
+        if best_seg_idx == 0:
+            print('early')
+            flux_selected = flux_early
+            flux_start_index -= 1.0
+        elif best_seg_idx == 1:
+            print('ontime')
+            flux_selected = flux_ontime
+        elif best_seg_idx == 2:
+            print('late')
+            flux_selected = flux_late
+            flux_start_index += 1.0
+
+        decoded_gcr_words.append(gcr_decoder(flux_selected, data_gcr_kernels))
         flux_start_index += 8*SYMBOL_PERIOD
 
     bit_array = np.unpackbits(np.reshape(np.array(decoded_gcr_words, dtype=np.uint8), (-1,1)), axis=1)
     bits = bit_array[:,-5:].flatten()
 
-    return np.packbits(bits)
+    # discard the last byte since this is not actually part of the payload
+    return np.packbits(bits)[:-1]
 
 def decode_sector_record(flux):
 
@@ -354,11 +374,31 @@ def decode_sector_record(flux):
     return decoded_gcr_words
 
 
+def compute_crc(data_sector):
+
+    BROTHER_POLY = 0x000201
+
+    crc = data_sector[0]
+    for byte in data_sector[1:256]:
+        for _ in range(8):
+            crc = ((crc << 1) ^ BROTHER_POLY) if (crc & 0x800000) else (crc << 1)
+        crc ^= byte
+
+    return crc & 0xFFFFFF
+
+
+def check_crc(data_sector):
+
+    crc_in_record = struct.unpack('>I', b'\x00' + data_sector[-3:].tobytes())[0]
+    crc_from_data = compute_crc(data_sector)
+
+    return crc_in_record == crc_from_data
+
 """
 Things left to do:
 
 - read the full .flux file from SQLITE database and extract all the sectors
-- symbol timing recovery
++ symbol timing recovery
 + identify start of each sector header segment and sector data segment
 - differential decoding (1's are encoded as flux transitions)
 - GCR decoding with soft decision input and error correction for both header and data
@@ -387,19 +427,14 @@ def main(filename):
         if header_bytes_pos[-1][1] == 0 and sector_0_idx is None:
             sector_0_idx = len(header_bytes_pos) - 1
 
-    offset = -47
-    flux_data_sector_0 = flux[data_start_indices[sector_0_idx] + offset :]
+    flux_data_sector_0 = flux[data_start_indices[sector_0_idx] - 47 :]
     data_bytes_sector_0 = decode_data_sector(flux_data_sector_0)
+    payload_bytes_sector_0 = data_bytes_sector_0[:256]
 
-    # try both polarities
-    # data_bytes_pos = decode_data_sector(first_data_sector_flux)
-    # data_bytes_neg = decode_data_sector(1 - first_data_sector_flux)
+    if not check_crc(data_bytes_sector_0):
+        print('CRC check failed')
 
-    data_bytes_sector_0.tofile('/tmp/good_disk/track0sector0.bin')
-
-    # mf_out = matched_filter(flux)
-
-    # symbols = timing_recovery(mf_out)
+    payload_bytes_sector_0.tofile('/tmp/good_disk/track0sector0.bin')
 
     import IPython; IPython.embed()
 
