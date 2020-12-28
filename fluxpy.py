@@ -60,51 +60,6 @@ def bytecode_to_array(bytecode: bytes):
     return np.array(pulse_train, dtype=np.uint8), np.array(flux), np.array(pulse_intervals)
 
 
-def matched_filter(flux: np.ndarray) -> np.ndarray:
-
-    # FIXME: hard-coded period
-    SYMBOL_PERIOD = 47
-
-    mf_h = np.ones(SYMBOL_PERIOD) / SYMBOL_PERIOD
-
-    return np.convolve(flux, mf_h)
-
-
-def timing_recovery(mf_output):
-
-    # FIXME: hard-coded period
-    SYMBOL_PERIOD = 46.875
-
-    index_float = 0.0
-    symbols = []
-
-    # this is a primitive algorithm that tries to stay aligned with the peak of the eye opening
-    while True:
-
-        index_float += SYMBOL_PERIOD
-
-        index = int(np.round(index_float))
-
-        try:
-            # check one sample ahead and behind and adjust alignment if needed
-            ontime = mf_output[index]
-            early = mf_output[index - 1]
-            late = mf_output[index + 1]
-            if np.abs(early) > np.abs(ontime):
-                index_float -= 1.0
-                index -= 1
-            elif np.abs(late) > np.abs(ontime):
-                index_float += 1.0
-                index += 1
-
-            symbols.append(mf_output[index])
-
-        except IndexError:
-            break
-
-    return np.array(symbols)
-
-
 def diff_encode(input):
 
     out = [0]
@@ -299,22 +254,12 @@ def gcr_decoder(flux, kernels):
 
     # Take absolute value because data is encoded in transitions -- polarity is not important
     corr = np.abs(np.sum(flux * kernels, axis=1))
-
-    # if len(kernels) < 77:
-    #     import matplotlib.pyplot as plt
-    #     import IPython; IPython.embed()
-
     return np.argmax(corr)
 
 
 def decode_data_sector(flux):
 
-    # FIXME: hard-coded
-    # this needs to either be estimated to high accuracy or the starting indices for each GCR word
-    # should be estimated using the full sector flux data rather than relying on extrapolation from
-    # the sector start word
-    SYMBOL_PERIOD = 47.03
-    SYMBOL_PERIOD_INT = int(np.round(SYMBOL_PERIOD))
+    SYMBOL_PERIOD = 47
 
     BROTHER_DATA_RECORD_ENCODED_SIZE = 415
 
@@ -329,20 +274,18 @@ def decode_data_sector(flux):
         flux_ontime = flux[int(flux_start_index) : int(flux_start_index) + samples_per_gcr_word]
         flux_late = flux[int(flux_start_index) + 1 : int(flux_start_index) + samples_per_gcr_word + 1]
 
-        early = np.sum(np.abs(np.correlate(flux_early, np.ones(SYMBOL_PERIOD_INT))[::SYMBOL_PERIOD_INT]))
-        ontime = np.sum(np.abs(np.correlate(flux_ontime, np.ones(SYMBOL_PERIOD_INT))[::SYMBOL_PERIOD_INT]))
-        late = np.sum(np.abs(np.correlate(flux_late, np.ones(SYMBOL_PERIOD_INT))[::SYMBOL_PERIOD_INT]))
+        early = np.sum(np.abs(np.correlate(flux_early, np.ones(SYMBOL_PERIOD))[::SYMBOL_PERIOD]))
+        ontime = np.sum(np.abs(np.correlate(flux_ontime, np.ones(SYMBOL_PERIOD))[::SYMBOL_PERIOD]))
+        late = np.sum(np.abs(np.correlate(flux_late, np.ones(SYMBOL_PERIOD))[::SYMBOL_PERIOD]))
 
+        # adjust timing by one sample forward or backward if needed
         best_seg_idx = np.argmax((early, ontime, late))
         if best_seg_idx == 0:
-            print('early')
             flux_selected = flux_early
             flux_start_index -= 1.0
         elif best_seg_idx == 1:
-            print('ontime')
             flux_selected = flux_ontime
         elif best_seg_idx == 2:
-            print('late')
             flux_selected = flux_late
             flux_start_index += 1.0
 
@@ -400,8 +343,8 @@ Things left to do:
 - read the full .flux file from SQLITE database and extract all the sectors
 + symbol timing recovery
 + identify start of each sector header segment and sector data segment
-- differential decoding (1's are encoded as flux transitions)
-- GCR decoding with soft decision input and error correction for both header and data
++ differential decoding (1's are encoded as flux transitions)
++ GCR decoding with soft decision input and error correction for both header and data
   > fluxengine decodes GRC with a lookup table which means it just fails if there are any bit
     errors in the raw flux transitions.
 """
