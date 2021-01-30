@@ -8,12 +8,18 @@ import sqlite3
 import pickle
 import numpy as np
 
+NUM_TRACKS = 39
+NUM_SECTORS = 12
+
 # each of these starts with 53 1's
 # SECTOR_HEADER = np.unpackbits(np.array([0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD, 0x57], dtype=np.uint8))[1:]
 # SECTOR_DATA = np.unpackbits(np.array([0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD, 0xDB], dtype=np.uint8))[1:]
 
-NUM_TRACKS = 39
-NUM_SECTORS = 12
+# Turns out it's actually better to use less of the leading 1's in the header when matching, since
+# then the timing estimate for the start of the sector is better. When the full header is used the
+# timing estimate is probably good for the middle of the header, but then it drifts significantly
+# towards the edges of the header. When I tried using the full-length header I was getting very
+# bad results.
 SECTOR_HEADER = np.unpackbits(np.array([0xFF, 0xFD, 0x57], dtype=np.uint8))[1:]
 SECTOR_DATA = np.unpackbits(np.array([0xFF, 0xFD, 0xDB], dtype=np.uint8))[1:]
 SECTOR_ORDER = [0, 5, 10, 3, 8, 1, 6, 11, 4, 9, 2, 7]
@@ -661,17 +667,5 @@ def main(filename):
     with open(filename + '.img', 'wb') as f:
         f.write(disk_image)
 
-    import IPython; IPython.embed()
-
 if __name__ == "__main__":
     main(sys.argv[1])
-
-
-"""
-best so far: 0 bad CRCs, 22 missing sectors with 8 early/late offset
-
-
-open issues:
-- timing recovery seems fragile
-- sometimes get spurious sector headers, could try to filter out spurious ones by looking at periodicity
-"""
